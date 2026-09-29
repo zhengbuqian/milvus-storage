@@ -16,10 +16,12 @@
 
 #include <memory>
 
+#include <arrow/extension_type.h>
 #include <arrow/io/buffered.h>
 #include <arrow/io/memory.h>
 #include <arrow/util/byte_size.h>
 #include <arrow/util/compression.h>
+#include <parquet/arrow/schema.h>
 #include <parquet/properties.h>
 #include <parquet/metadata.h>
 #include <boost/variant.hpp>
@@ -116,6 +118,45 @@ static arrow::Result<std::shared_ptr<::parquet::WriterProperties>> convert_write
   return builder.build();
 }
 
+static arrow::Status configure_leaf_column(const arrow::Field& field,
+                                           const ::parquet::SchemaDescriptor& parquet_schema,
+                                           int* column_index,
+                                           ::parquet::WriterProperties::Builder* builder) {
+  auto type = field.type();
+  while (type->id() == arrow::Type::EXTENSION) {
+    type = std::static_pointer_cast<arrow::ExtensionType>(type)->storage_type();
+  }
+  for (const auto& child : type->fields()) {
+    ARROW_RETURN_NOT_OK(configure_leaf_column(*child, parquet_schema, column_index, builder));
+  }
+  if (type->num_fields() != 0) {
+    return arrow::Status::OK();
+  }
+  if (*column_index >= parquet_schema.num_columns()) {
+    return arrow::Status::Invalid("Arrow schema has more leaves than the Parquet schema");
+  }
+
+  // Use the converted Parquet column path: LIST levels add path components
+  // that are not present in the Arrow field tree.
+  const auto path = parquet_schema.Column((*column_index)++)->path()->ToDotString();
+  switch (type->id()) {
+    case arrow::Type::FIXED_SIZE_BINARY:
+      // Vector bytes do not benefit from compression or min/max statistics.
+      // Reset the level because Parquet rejects an explicit level with UNCOMPRESSED.
+      builder->compression(path, ::parquet::Compression::UNCOMPRESSED);
+      builder->compression_level(path, ::arrow::util::kUseDefaultCompressionLevel);
+      builder->disable_statistics(path);
+      break;
+    case arrow::Type::BINARY:
+      // Binary payloads may benefit from compression, but not min/max statistics.
+      builder->disable_statistics(path);
+      break;
+    default:
+      break;
+  }
+  return arrow::Status::OK();
+}
+
 ParquetFileWriter::ParquetFileWriter(std::shared_ptr<arrow::Schema> schema,
                                      std::shared_ptr<arrow::fs::FileSystem> fs,
                                      const std::string& file_path,
@@ -146,32 +187,6 @@ ParquetFileWriter::ParquetFileWriter(std::shared_ptr<arrow::Schema> schema,
   if (writer_props->default_column_properties().compression() == ::parquet::Compression::UNCOMPRESSED) {
     builder.compression(::parquet::Compression::ZSTD);
     builder.compression_level(3);
-  }
-
-  for (int i = 0; i < schema_->num_fields(); ++i) {
-    auto field = schema_->field(i);
-    switch (field->type()->id()) {
-      case arrow::Type::FIXED_SIZE_BINARY:
-        // Dense vector columns are effectively random bytes; ZSTD wastes
-        // CPU on them without shrinking the output. Always emit them
-        // UNCOMPRESSED and skip statistics. The per-column level is reset
-        // to the codec-default sentinel because parquet rejects
-        // "UNCOMPRESSED + explicit level" at build time.
-        builder.compression(field->name(), ::parquet::Compression::UNCOMPRESSED);
-        builder.compression_level(field->name(), ::arrow::util::kUseDefaultCompressionLevel);
-        builder.disable_statistics(field->name());
-        break;
-      case arrow::Type::BINARY:
-        // Variable-length binary may carry LOB payloads or sparse vectors;
-        // leave the caller's compression choice alone. Statistics on long
-        // binary blobs are not useful, so skip those.
-        builder.disable_statistics(field->name());
-        break;
-      default:
-        // TODO: truncate statistics for long varible length columns when arrow support it.
-        // See: https://github.com/apache/arrow/issues/36139
-        break;
-    }
   }
 
   writer_props_ = builder.build();
@@ -205,6 +220,22 @@ arrow::Status ParquetFileWriter::init() {
   if (!fs_) {
     return arrow::Status::Invalid("Invalid file system for parquet file writer");
   }
+
+  std::shared_ptr<::parquet::SchemaDescriptor> parquet_schema;
+  ARROW_RETURN_NOT_OK(::parquet::arrow::ToParquetSchema(schema_.get(), *writer_props_, &parquet_schema));
+  ::parquet::WriterProperties::Builder builder(*writer_props_);
+  // Arrow's Builder copy constructor does not copy encryption properties.
+  if (writer_props_->file_encryption_properties()) {
+    builder.encryption(writer_props_->file_encryption_properties()->DeepClone());
+  }
+  int column_index = 0;
+  for (const auto& field : schema_->fields()) {
+    ARROW_RETURN_NOT_OK(configure_leaf_column(*field, *parquet_schema, &column_index, &builder));
+  }
+  if (column_index != parquet_schema->num_columns()) {
+    return arrow::Status::Invalid("Arrow schema has fewer leaves than the Parquet schema");
+  }
+  writer_props_ = builder.build();
 
   // Although the DIR is created in `column_group_writer`,
   // the current logic cannot be removed. It is still dependent

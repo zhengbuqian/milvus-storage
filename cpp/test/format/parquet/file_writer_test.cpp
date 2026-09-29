@@ -146,6 +146,83 @@ class ParquetFileWriterTest : public ::testing::Test {
   std::string base_path_;
 };
 
+TEST_F(ParquetFileWriterTest, NestedBinaryLeafProperties) {
+  auto fixed_values = std::make_shared<arrow::FixedSizeBinaryBuilder>(arrow::fixed_size_binary(4));
+  auto fixed_list_type = arrow::list(arrow::field("item", arrow::fixed_size_binary(4)));
+  arrow::ListBuilder fixed_list_builder(arrow::default_memory_pool(), fixed_values, fixed_list_type);
+  ASSERT_STATUS_OK(fixed_list_builder.Append());
+  ASSERT_STATUS_OK(fixed_values->Append(reinterpret_cast<const uint8_t*>("abcd")));
+  ASSERT_AND_ASSIGN(auto fixed_list, fixed_list_builder.Finish());
+
+  auto binary_values = std::make_shared<arrow::BinaryBuilder>();
+  auto binary_list_type = arrow::list(arrow::field("item", arrow::binary()));
+  arrow::ListBuilder binary_list_builder(arrow::default_memory_pool(), binary_values, binary_list_type);
+  ASSERT_STATUS_OK(binary_list_builder.Append());
+  ASSERT_STATUS_OK(binary_values->Append("binary payload"));
+  ASSERT_AND_ASSIGN(auto binary_list, binary_list_builder.Finish());
+
+  auto int_values = std::make_shared<arrow::Int64Builder>();
+  auto inner_list_type = arrow::list(arrow::field("item", arrow::int64()));
+  auto outer_list_type = arrow::list(arrow::field("item", inner_list_type));
+  auto inner_list_builder =
+      std::make_shared<arrow::ListBuilder>(arrow::default_memory_pool(), int_values, inner_list_type);
+  arrow::ListBuilder outer_list_builder(arrow::default_memory_pool(), inner_list_builder, outer_list_type);
+  ASSERT_STATUS_OK(outer_list_builder.Append());
+  ASSERT_STATUS_OK(inner_list_builder->Append());
+  ASSERT_STATUS_OK(int_values->Append(7));
+  ASSERT_STATUS_OK(inner_list_builder->Append());
+  ASSERT_STATUS_OK(int_values->Append(8));
+  ASSERT_AND_ASSIGN(auto nested_list, outer_list_builder.Finish());
+
+  arrow::BinaryBuilder top_binary_builder;
+  ASSERT_STATUS_OK(top_binary_builder.Append("top payload"));
+  ASSERT_AND_ASSIGN(auto top_binary, top_binary_builder.Finish());
+  arrow::FixedSizeBinaryBuilder top_fixed_builder(arrow::fixed_size_binary(4));
+  ASSERT_STATUS_OK(top_fixed_builder.Append(reinterpret_cast<const uint8_t*>("wxyz")));
+  ASSERT_AND_ASSIGN(auto top_fixed, top_fixed_builder.Finish());
+
+  auto schema = arrow::schema(
+      {arrow::field("fixed_vectors", fixed_list->type()), arrow::field("binary_vectors", binary_list->type()),
+       arrow::field("nested_numbers", nested_list->type()), arrow::field("top_binary", arrow::binary()),
+       arrow::field("top_fixed", arrow::fixed_size_binary(4))});
+  auto batch = arrow::RecordBatch::Make(schema, 1, {fixed_list, binary_list, nested_list, top_binary, top_fixed});
+
+  ::parquet::WriterProperties::Builder properties_builder;
+  properties_builder.compression(::parquet::Compression::ZSTD);
+  properties_builder.compression_level(3);
+  const std::string file_path = base_path_ + "/data/vector_leaf_properties.parquet";
+  ASSERT_AND_ASSIGN(auto writer, milvus_storage::parquet::ParquetFileWriter::Make(
+                                     schema, fs_, file_path, StorageConfig{}, properties_builder.build()));
+  ASSERT_STATUS_OK(writer->Write(batch));
+  ASSERT_TRUE(writer->Close().ok());
+
+  ASSERT_AND_ASSIGN(auto input, fs_->OpenInputFile(file_path));
+  auto metadata = ::parquet::ParquetFileReader::Open(input)->metadata();
+  ASSERT_EQ(metadata->num_row_groups(), 1);
+  ASSERT_EQ(metadata->num_columns(), 5);
+
+  struct ExpectedColumn {
+    const char* path;
+    bool has_stats;
+    ::parquet::Compression::type compression;
+  };
+  // Arrow child fields are named "item" above; Parquet's compliant LIST
+  // conversion writes them as "element" in the physical column path.
+  const std::vector<ExpectedColumn> expected = {
+      {"fixed_vectors.list.element", false, ::parquet::Compression::UNCOMPRESSED},
+      {"binary_vectors.list.element", false, ::parquet::Compression::ZSTD},
+      {"nested_numbers.list.element.list.element", true, ::parquet::Compression::ZSTD},
+      {"top_binary", false, ::parquet::Compression::ZSTD},
+      {"top_fixed", false, ::parquet::Compression::UNCOMPRESSED},
+  };
+  for (int i = 0; i < metadata->num_columns(); ++i) {
+    auto column = metadata->RowGroup(0)->ColumnChunk(i);
+    EXPECT_EQ(column->path_in_schema()->ToDotString(), expected[i].path);
+    EXPECT_EQ(column->is_stats_set(), expected[i].has_stats) << expected[i].path;
+    EXPECT_EQ(column->compression(), expected[i].compression) << expected[i].path;
+  }
+}
+
 TEST_F(ParquetFileWriterTest, LargeRecordBatchSplitting) {
   // Create a large record batch with mixed data sizes
   const int64_t num_rows = 1000;
